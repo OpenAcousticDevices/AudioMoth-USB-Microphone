@@ -17,6 +17,6 @@ If building from the command line tools no further changes are necessary. Howeve
 
 ### License ###
 
-Copyright 2017 [Open Acoustic Devices](http://www.openacousticdevices.info/).
+Copyright 2021 [Open Acoustic Devices](http://www.openacousticdevices.info/).
 
 [MIT license](http://www.openacousticdevices.info/license).
