@@ -9,7 +9,7 @@ Clone the contents of [AudioMoth-Project](https://github.com/OpenAcousticDevices
 
 Replace ```src/main.c``` with this ```main.c``` from this repository. Put all the remaining ```.c``` files in the ```/src/``` folder and all the ```.h``` files in the ```/inc/``` folder. 
 
-The firmware implements two different USB configurations with different numbers of end-points in each. This is not supported within the standard Silicon Labs USB library, so open ```em_usbd.c``` inside ```emnusb/src/``` and comment out lines 433 to 437. This removes an internal validation of the number of end-points described in the USB configuration.
+The firmware implements two different USB configurations with a different number of end-points in each. This is not supported within the standard Silicon Labs USB library, so open ```em_usbd.c``` inside ```emnusb/src/``` and comment out lines 433 to 437. This removes an internal validation of the number of end-points described in the USB configuration.
 
 ![alt text](https://github.com/OpenAcousticDevices/AudioMoth-USB-Microphone/blob/main/comment.png)
 
