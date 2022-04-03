@@ -4,6 +4,8 @@
  * August 2021
  *****************************************************************************/
 
+#include <math.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -17,9 +19,14 @@
 
 #define MILLISECONDS_IN_SECOND                  1000
 
+/* Useful frequency constants */
+
+#define HERTZ_IN_KILOHERTZ                      1000
+
 /* Useful type constant */
 
 #define UINT32_SIZE_IN_BYTES                    4
+#define CHAR16_SIZE_IN_BYTES                    2
 
 /* Sleep and LED constants */
 
@@ -30,7 +37,7 @@
 
 #define MAIN_LOOP_WAIT_INTERVAL                 10
 #define DEFAULT_DELAY_INTERVAL                  100
-#define MICROPHONE_CHANGE_INTERVAL              800
+#define MICROPHONE_CHANGE_INTERVAL              2000
 
 /* USB EM2 wake constant */
 
@@ -39,13 +46,14 @@
 /* Buffer constants */
 
 #define NUMBER_OF_BUFFERS                       8
+#define MINIMUM_BUFFER_SEPARATION               2
 #define NUMBER_OF_BYTES_IN_SAMPLE               2
 #define MAXIMUM_SAMPLES_IN_DMA_TRANSFER         (MAXIMUM_SAMPLE_RATE / 1000)
 #define MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER       (MAXIMUM_SAMPLES_IN_DMA_TRANSFER * NUMBER_OF_BYTES_IN_SAMPLE)
 
 /* DMA LED constant */
 
-#define DMA_LED_ON_TIME                         40
+#define DMA_LED_ON_TIME                         20
 #define AM_SD_CARD_BUFFER_SIZE                  32768
 #define DMA_SAMPLES_PER_LED_PERIOD              (AM_SD_CARD_BUFFER_SIZE / NUMBER_OF_BYTES_IN_SAMPLE)
 
@@ -66,14 +74,31 @@
 
 #define ENERGY_SAVER_SAMPLE_RATE_THRESHOLD      48000
 
-/* Default gain setting constant */
-
-#define DEFAULT_GAIN_SETTING                    2
-
 /* Switch debounce constant */
 
 #define USB_DELAY_COUNT                         100
-#define SWITCH_DEBOUNCE_COUNT                   10
+#define SWITCH_DEBOUNCE_COUNT                   20
+
+/* Debugging constants */
+
+#define NUMBER_OF_SINE_BUFFERS                  (3 * NUMBER_OF_BUFFERS / 2)
+#define GENERATE_SINE_WAVE                      false
+
+/* USB descriptor constants */
+
+#define USB_STRING_DESCRIPTOR_INDEX             2
+#define USB_STRING_DESCRIPTOR_OFFSET            2
+#define USB_DESCRIPTOR_SIZE                     128
+
+/* Maths constants */
+
+#ifndef M_PI
+#define M_PI                                    3.14159265358979323846f
+#endif
+
+#ifndef M_TWOPI
+#define M_TWOPI                                 (2.0f * M_PI)
+#endif
 
 /* Useful macros */
 
@@ -97,6 +122,7 @@ typedef struct {
     uint16_t higherFilterFreq;
     uint8_t enableEnergySaverMode : 1; 
     uint8_t disable48HzDCBlockingFilter : 1;
+    uint8_t enableLowGainRange : 1;
 } configSettings_t;
 
 #pragma pack(pop)
@@ -113,6 +139,7 @@ static configSettings_t defaultConfigSettings = {
     .higherFilterFreq = 0,
     .enableEnergySaverMode = 0,
     .disable48HzDCBlockingFilter = 0,
+    .enableLowGainRange = 0
 };
 
 configSettings_t *configSettings = &defaultConfigSettings;
@@ -129,6 +156,20 @@ typedef struct {
 
 #pragma pack(pop)
 
+/* USB Descriptor */
+
+static uint8_t descriptor[USB_DESCRIPTOR_SIZE] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
+
+/* LED status */
+
+typedef enum {LED_NONE, LED_RED, LED_GREEN} ledColour_t;
+
+ledColour_t ledColour = LED_NONE;
+
+/* Switch state */
+
+AM_switchPosition_t switchPosition;
+
 /* DMA transfer variable */
 
 static uint32_t transferCount;
@@ -139,7 +180,7 @@ static uint32_t energySaverFactor;
 
 static uint32_t numberOfSamplesInBuffer;
 
-static uint32_t numberOfSamplesInDMATransfer;
+static uint32_t numberOfRawSamplesInDMATransfer;
 
 /* DMA buffers */
 
@@ -161,19 +202,29 @@ static volatile bool microphoneChanged;
 
 /* Sample buffer variables */
 
-static uint32_t writeBuffer;
+static uint32_t readBuffer;
 
-static uint32_t writeBufferIndex;
+static uint32_t writeBuffer;
 
 static int16_t* buffers[NUMBER_OF_BUFFERS];
 
 static uint8_t silentBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
 
+static uint8_t interpolationBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
+
 static uint8_t sampleBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_BUFFERS] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
+
+/* Debugging sine buffer */
+
+static uint32_t sineBufferCounter;
+
+static int16_t* sineBuffers[NUMBER_OF_SINE_BUFFERS];
+
+static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUFFERS] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 0, 0};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 1, 0};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
 
@@ -205,15 +256,49 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     numberOfSamplesInBuffer = effectiveSampleRate / MILLISECONDS_IN_SECOND;
 
-    numberOfSamplesInDMATransfer = configSettings->sampleRate / energySaverFactor / MILLISECONDS_IN_SECOND;
+    numberOfRawSamplesInDMATransfer = configSettings->sampleRate / energySaverFactor / MILLISECONDS_IN_SECOND;
+
+    /* Fill the sine buffer */
+
+    if (GENERATE_SINE_WAVE) {
+
+        for (uint32_t i = 0; i < NUMBER_OF_SINE_BUFFERS; i += 1) {
+
+            for (uint32_t j = 0; j < numberOfSamplesInBuffer; j += 1) {
+
+                sineBuffers[i][j] = (int16_t)((float)INT16_MAX / 2.0f * sinf(M_TWOPI * (float)(i * numberOfSamplesInBuffer + j) / (float)NUMBER_OF_SINE_BUFFERS / (float)numberOfSamplesInBuffer));
+
+            }
+
+        }
+
+    }
+
+    /* Update USB string descriptor for sample rate */
+
+    for (uint32_t i = 0; i < USB_DESCRIPTOR_SIZE; i += 1) descriptor[i] = 0;
+
+    uint32_t length = sprintf((char*)descriptor + USB_STRING_DESCRIPTOR_OFFSET, "AudioMoth USB Microphone (%lukHz)", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
+
+    descriptor[0] = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
+
+    descriptor[1] = USB_STRING_DESCRIPTOR;
+
+    char* src = (char*)descriptor + USB_STRING_DESCRIPTOR_OFFSET;
+
+    char16_t* dst = (char16_t*)src;
+
+    for (uint32_t i = 0; i < length; i += 1) dst[length - 1 - i] = src[length - 1 - i];
+
+    strings[USB_STRING_DESCRIPTOR_INDEX] = descriptor;
 
     /* Update USB configuration sample rate and buffer size */
+
+    uint32_t usbBufferSize = numberOfSamplesInBuffer * NUMBER_OF_BYTES_IN_SAMPLE;
 
     configDesc[SAMPLE_RATE_OFFSET] = (uint8_t)effectiveSampleRate;
     configDesc[SAMPLE_RATE_OFFSET + 1] = (uint8_t)(effectiveSampleRate >> 8);
     configDesc[SAMPLE_RATE_OFFSET + 2] = (uint8_t)(effectiveSampleRate >> 16);
-
-    uint32_t usbBufferSize = numberOfSamplesInBuffer * NUMBER_OF_BYTES_IN_SAMPLE;
 
     configDesc[BUFFER_SIZE_OFFSET] = (uint8_t)usbBufferSize;
     configDesc[BUFFER_SIZE_OFFSET + 1] = (uint8_t)(usbBufferSize >> 8);
@@ -246,15 +331,33 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     float sampleMultiplier = 16.0f / (float)(configSettings->oversampleRate * configSettings->sampleRateDivider / energySaverFactor);
 
+    if (AudioMoth_hasInvertedOutput()) sampleMultiplier = -sampleMultiplier;
+
     DigitalFilter_applyAdditionalGain(sampleMultiplier);
 
 }
 
 void startMicrophoneSamples(bool useDefaultSetting) {
 
-    AudioMoth_enableMicrophone(useDefaultSetting ? DEFAULT_GAIN_SETTING : configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
+    /* Initialise the counters */
+    
+    readBuffer = 0;
 
-    AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, numberOfSamplesInDMATransfer);
+    writeBuffer = NUMBER_OF_BUFFERS / 2;
+
+    if (GENERATE_SINE_WAVE) sineBufferCounter = 0;
+
+    /* Clear the buffers */
+
+    memset(sampleBuffer, 0, sizeof(sampleBuffer));
+
+    /* Enable and start the microphone */
+
+    AM_gainRange_t gainRange = useDefaultSetting ? AM_NORMAL_GAIN_RANGE : configSettings->enableLowGainRange ? AM_LOW_GAIN_RANGE : AM_NORMAL_GAIN_RANGE;
+
+    AudioMoth_enableMicrophone(gainRange, configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
+
+    AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, numberOfRawSamplesInDMATransfer);
 
     AudioMoth_startMicrophoneSamples(configSettings->sampleRate / energySaverFactor);
 
@@ -278,7 +381,21 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     transferCount += 1;
 
-    AudioMoth_setRedLED(!microphoneRestarting && transferCount < DMA_LED_ON_TIME);
+    bool ledStatus = !microphoneRestarting && transferCount < DMA_LED_ON_TIME;
+
+    if (ledColour == LED_RED) {
+
+        AudioMoth_setRedLED(ledStatus);
+
+    } else if (ledColour == LED_GREEN) {
+
+        AudioMoth_setGreenLED(ledStatus);
+
+    } else {
+
+        AudioMoth_setBothLED(false);
+
+    }
 
     if (transferCount > transferPeriod) transferCount = 0;
 
@@ -286,21 +403,19 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     int16_t *source = isPrimaryBuffer ? primaryBuffer : secondaryBuffer;
 
-    DigitalFilter_filter(source, buffers[writeBuffer] + writeBufferIndex, configSettings->sampleRateDivider / energySaverFactor, numberOfSamplesInDMATransfer);
+    DigitalFilter_filter(source, buffers[writeBuffer], configSettings->sampleRateDivider / energySaverFactor, numberOfRawSamplesInDMATransfer);
 
     /* Update the current buffer index and write buffer */
 
-    writeBufferIndex += numberOfSamplesInDMATransfer / configSettings->sampleRateDivider * energySaverFactor;
+    if (GENERATE_SINE_WAVE) {
 
-    if (writeBufferIndex == numberOfSamplesInBuffer) {
+        memcpy(buffers[writeBuffer], sineBuffers[sineBufferCounter], MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER);
 
-        writeBufferIndex = 0;
-
-        writeBuffer = (writeBuffer + 1) % NUMBER_OF_BUFFERS;
+        sineBufferCounter = (sineBufferCounter + 1) % NUMBER_OF_SINE_BUFFERS;
 
     }
 
-    AudioMoth_setRedLED(false);
+    writeBuffer = (writeBuffer + 1) % NUMBER_OF_BUFFERS;
 
 }
 
@@ -388,15 +503,76 @@ static int setupCmd(const USB_Setup_TypeDef *setup) {
 
 }
 
-/*  Callback on completion of USB microphone data send.  Used to send next data. */
+/*  Callback on completion of USB microphone data send. Used to send next data. */
 
 int dataSentCallback(USB_Status_TypeDef status, uint32_t xferred, uint32_t remaining) {
 
     if (status == USB_STATUS_OK) {
 
-        uint32_t index = (writeBuffer + NUMBER_OF_BUFFERS - 2) % NUMBER_OF_BUFFERS;
+        uint8_t *data;
 
-        uint8_t *data = microphoneMuted || microphoneRestarting ? silentBuffer : (uint8_t*)buffers[index];
+        uint32_t bufferLag = (writeBuffer + NUMBER_OF_BUFFERS - readBuffer) % NUMBER_OF_BUFFERS;
+
+        if (bufferLag < MINIMUM_BUFFER_SEPARATION || bufferLag >= NUMBER_OF_BUFFERS - MINIMUM_BUFFER_SEPARATION) {
+
+            /* Get the previous sample sent */
+
+            uint32_t previousIndex = (readBuffer + NUMBER_OF_BUFFERS - 1) % NUMBER_OF_BUFFERS;
+
+            int16_t previousSample = buffers[previousIndex][numberOfSamplesInBuffer - 1];
+
+            int16_t *interpolationArray = (int16_t*)interpolationBuffer;
+
+            data = (uint8_t*)interpolationArray;
+
+            if (bufferLag < MINIMUM_BUFFER_SEPARATION) {
+
+                /* Generate additional spacer buffer by repeating the last sample sent */
+
+                for (uint32_t i = 0; i < numberOfSamplesInBuffer; i += 1) {
+                    
+                    interpolationArray[i] = previousSample;
+
+                }
+
+            } else {
+
+                /* Skip buffer and interpolate across the gap */
+
+                uint32_t lastIndex = (readBuffer + 1) % NUMBER_OF_BUFFERS;
+
+                int16_t lastSample = buffers[lastIndex][numberOfSamplesInBuffer - 1];
+
+                float step = ((float)lastSample - (float)previousSample) / (float)numberOfSamplesInBuffer;
+
+                float interpolatedValue = (float)previousSample + step;
+
+                for (uint32_t i = 0; i < numberOfSamplesInBuffer; i += 1) {
+                    
+                    interpolationArray[i] = (int16_t)interpolatedValue;
+
+                    interpolatedValue += step;
+
+                }
+
+                readBuffer = (readBuffer + 2) % NUMBER_OF_BUFFERS;
+
+            }
+
+        } else {
+
+            /* Select the appropriate source */
+
+            data = (uint8_t*)buffers[readBuffer];
+
+            readBuffer = (readBuffer + 1) % NUMBER_OF_BUFFERS;
+
+
+        }
+
+        /* Send the data to USB */
+
+        data = microphoneMuted || microphoneRestarting ? silentBuffer : data;
 
         USBD_Write(MICROPHONE_EP_IN, data, numberOfSamplesInBuffer * NUMBER_OF_BYTES_IN_SAMPLE, dataSentCallback);
 
@@ -508,11 +684,7 @@ int main(void) {
 
     } else {
 
-        /* Set up audio buffer */
-
-        writeBuffer = 0;
-
-        writeBufferIndex = 0;
+        /* Set up audio buffers */
 
         buffers[0] = (int16_t*)sampleBuffer;
 
@@ -520,7 +692,23 @@ int main(void) {
             buffers[i] = buffers[i - 1] + MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER / NUMBER_OF_BYTES_IN_SAMPLE;
         }
 
-        /* Enable the USB interface */
+        /* Set up debug sine buffers */
+
+        if (GENERATE_SINE_WAVE) {
+
+            sineBuffers[0] = (int16_t*)sineBuffer;
+
+            for (uint32_t i = 1; i < NUMBER_OF_SINE_BUFFERS; i += 1) {
+                sineBuffers[i] = sineBuffers[i - 1] + MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER / NUMBER_OF_BYTES_IN_SAMPLE;
+            }
+
+        }
+
+        /* Set LED colour */
+
+        ledColour = switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
+
+        /* Start the microphone samples */
 
         AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
 
@@ -528,7 +716,7 @@ int main(void) {
 
         startMicrophoneSamples(switchPosition == AM_SWITCH_DEFAULT);
 
-        /* Configure data input pin */
+        /* Enable the USB interface */
 
         USBD_Init(&initstruct);
 
@@ -569,6 +757,12 @@ int main(void) {
 
                 switchPosition = currentSwitchPosition;
 
+                /* Stop the LED */
+
+                ledColour = LED_NONE;
+
+                AudioMoth_setBothLED(false);
+
                 /* Restart with current microphone settings */
 
                 microphoneRestarting = true;
@@ -587,6 +781,10 @@ int main(void) {
 
                 microphoneRestarting = false;
 
+                /* Restart the LED */
+
+                ledColour = switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
+
                 /* Reset counter */
 
                 switchChangeCounter = 0;
@@ -596,6 +794,14 @@ int main(void) {
             /* Handle microphone change */
 
             if (microphoneChanged) {
+
+                /* Stop the LED */
+
+                ledColour = LED_NONE;
+
+                AudioMoth_setBothLED(false);
+
+                /* Restart with current microphone settings */
 
                 microphoneRestarting = true;
 
@@ -612,6 +818,10 @@ int main(void) {
                 microphoneRestarting = false;
 
                 microphoneChanged = false;
+
+                /* Restart the LED */
+
+                ledColour = switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
 
             }
 
