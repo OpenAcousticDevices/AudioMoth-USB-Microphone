@@ -224,7 +224,7 @@ static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUF
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 1, 0};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 1, 1};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
 
@@ -278,7 +278,7 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     for (uint32_t i = 0; i < USB_DESCRIPTOR_SIZE; i += 1) descriptor[i] = 0;
 
-    uint32_t length = sprintf((char*)descriptor + USB_STRING_DESCRIPTOR_OFFSET, "AudioMoth USB Microphone (%lukHz)", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
+    uint32_t length = sprintf((char*)descriptor + USB_STRING_DESCRIPTOR_OFFSET, "AudioMoth USB Microphone %lukHz", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
 
     descriptor[0] = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
 
