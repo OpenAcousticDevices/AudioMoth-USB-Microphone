@@ -86,9 +86,14 @@
 
 /* USB descriptor constants */
 
-#define USB_STRING_DESCRIPTOR_INDEX             2
+#define USB_PRODUCT_STRING_DESCRIPTOR_INDEX     2
+#define USB_SERIAL_STRING_DESCRIPTOR_INDEX      3
+
 #define USB_STRING_DESCRIPTOR_OFFSET            2
-#define USB_DESCRIPTOR_SIZE                     128
+#define USB_STRING_DESCRIPTOR_SIZE              128
+
+#define USB_SERIAL_NUMBER_LENGTH                4
+#define BITS_PER_BCD_DIGIT                      4
 
 /* Maths constants */
 
@@ -123,6 +128,7 @@ typedef struct {
     uint8_t enableEnergySaverMode : 1; 
     uint8_t disable48HzDCBlockingFilter : 1;
     uint8_t enableLowGainRange : 1;
+    uint8_t disableLED : 1;
 } configSettings_t;
 
 #pragma pack(pop)
@@ -134,12 +140,13 @@ static configSettings_t defaultConfigSettings = {
     .acquisitionCycles = 16,
     .oversampleRate = 1,
     .sampleRate = 384000,
-    .sampleRateDivider = 8,
+    .sampleRateDivider = 1,
     .lowerFilterFreq = 0,
     .higherFilterFreq = 0,
     .enableEnergySaverMode = 0,
     .disable48HzDCBlockingFilter = 0,
-    .enableLowGainRange = 0
+    .enableLowGainRange = 0,
+    .disableLED = 0
 };
 
 configSettings_t *configSettings = &defaultConfigSettings;
@@ -156,9 +163,11 @@ typedef struct {
 
 #pragma pack(pop)
 
-/* USB Descriptor */
+/* USB descriptors */
 
-static uint8_t descriptor[USB_DESCRIPTOR_SIZE] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
+static uint8_t productDescriptor[USB_STRING_DESCRIPTOR_SIZE] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
+
+static uint8_t serialDescriptor[USB_STRING_DESCRIPTOR_SIZE] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
 
 /* LED status */
 
@@ -224,7 +233,7 @@ static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUF
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 1, 1};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 2, 0};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
 
@@ -274,23 +283,49 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     }
 
+    /* Update USB device release and serial number */
+
+    for (uint32_t i = 0; i < USB_STRING_DESCRIPTOR_SIZE; i += 1) serialDescriptor[i] = 0;
+
+    serialDescriptor[0] = CHAR16_SIZE_IN_BYTES * USB_SERIAL_NUMBER_LENGTH + CHAR16_SIZE_IN_BYTES;
+
+    serialDescriptor[1] = USB_STRING_DESCRIPTOR;
+
+    uint32_t sampleRate = effectiveSampleRate / HERTZ_IN_KILOHERTZ;
+
+    deviceDesc.bcdDevice = 0;
+
+    for (uint32_t i = 0; i < USB_SERIAL_NUMBER_LENGTH; i += 1) {
+
+        uint32_t digit = sampleRate % 10;
+
+        serialDescriptor[USB_STRING_DESCRIPTOR_OFFSET + 2 * (USB_SERIAL_NUMBER_LENGTH - i - 1)] = '0' + digit;
+
+        deviceDesc.bcdDevice |= digit << (BITS_PER_BCD_DIGIT * i);
+
+        sampleRate = (sampleRate - digit) / 10;
+
+    }
+
+    strings[USB_SERIAL_STRING_DESCRIPTOR_INDEX] = serialDescriptor;
+
     /* Update USB string descriptor for sample rate */
 
-    for (uint32_t i = 0; i < USB_DESCRIPTOR_SIZE; i += 1) descriptor[i] = 0;
+    for (uint32_t i = 0; i < USB_STRING_DESCRIPTOR_SIZE; i += 1) productDescriptor[i] = 0;
 
-    uint32_t length = sprintf((char*)descriptor + USB_STRING_DESCRIPTOR_OFFSET, "AudioMoth USB Microphone %lukHz", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
+    uint32_t length = sprintf((char*)productDescriptor + USB_STRING_DESCRIPTOR_OFFSET, "%lukHz AudioMoth USB Microphone", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
 
-    descriptor[0] = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
+    productDescriptor[0] = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
 
-    descriptor[1] = USB_STRING_DESCRIPTOR;
+    productDescriptor[1] = USB_STRING_DESCRIPTOR;
 
-    char* src = (char*)descriptor + USB_STRING_DESCRIPTOR_OFFSET;
+    char* src = (char*)productDescriptor + USB_STRING_DESCRIPTOR_OFFSET;
 
     char16_t* dst = (char16_t*)src;
 
     for (uint32_t i = 0; i < length; i += 1) dst[length - 1 - i] = src[length - 1 - i];
 
-    strings[USB_STRING_DESCRIPTOR_INDEX] = descriptor;
+    strings[USB_PRODUCT_STRING_DESCRIPTOR_INDEX] = productDescriptor;
 
     /* Update USB configuration sample rate and buffer size */
 
@@ -706,7 +741,7 @@ int main(void) {
 
         /* Set LED colour */
 
-        ledColour = switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
+        ledColour = configSettings->disableLED ? LED_NONE : switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
 
         /* Start the microphone samples */
 
@@ -783,7 +818,7 @@ int main(void) {
 
                 /* Restart the LED */
 
-                ledColour = switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
+                ledColour = configSettings->disableLED ? LED_NONE : switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
 
                 /* Reset counter */
 
@@ -821,7 +856,7 @@ int main(void) {
 
                 /* Restart the LED */
 
-                ledColour = switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
+                ledColour = configSettings->disableLED ? LED_NONE : switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
 
             }
 

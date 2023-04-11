@@ -37,7 +37,7 @@
 /* Device descriptor */
 
 SL_ALIGN(4)
-static const USB_DeviceDescriptor_TypeDef deviceDesc __attribute__ ((aligned(4)))= {
+static USB_DeviceDescriptor_TypeDef deviceDesc __attribute__ ((aligned(4)))= {
     .bLength            = USB_DEVICE_DESCSIZE,            /* Size of the Descriptor in Bytes          */
     .bDescriptorType    = USB_DEVICE_DESCRIPTOR,          /* Device Descriptor type                   */
     .bcdUSB             = 0x0200,                         /* USB 2.0 compliant                        */
@@ -45,8 +45,8 @@ static const USB_DeviceDescriptor_TypeDef deviceDesc __attribute__ ((aligned(4))
     .bDeviceSubClass    = 0x00,                           /* Ignored for vendor unique device         */
     .bDeviceProtocol    = 0x00,                           /* Ignored for vendor unique device         */
     .bMaxPacketSize0    = USB_EP0_SIZE,                   /* Max packet size for EP0                  */
-    .idVendor           = 0x10C4,                         /* VID                                      */
-    .idProduct          = 0x0002,                         /* PID                                      */
+    .idVendor           = 0x16D0,                         /* VID                                      */
+    .idProduct          = 0x06F3,                         /* PID                                      */
     .bcdDevice          = 0x0000,                         /* Device Release number                    */
     .iManufacturer      = 0x01,                           /* Index of Manufacturer String Descriptor  */
     .iProduct           = 0x02,                           /* Index of Product String Descriptor       */
@@ -210,7 +210,7 @@ STATIC_CONST_STRING_DESC(iManufacturer, 'o', 'p', 'e', 'n', 'a', 'c', 'o', 'u', 
 
 STATIC_CONST_STRING_DESC(iProduct, 'A', 'u', 'd', 'i', 'o', 'M', 'o', 't', 'h', ' ', 'U', 'S', 'B', ' ', 'M', 'i', 'c', 'r', 'o', 'p', 'h', 'o', 'n', 'e');
 
-STATIC_CONST_STRING_DESC(iSerialNumber, '0', '1', '0', '0');
+STATIC_CONST_STRING_DESC(iSerialNumber, '0', '0', '0', '0');
 
 /* End-point buffer sizes */
 
