@@ -233,7 +233,7 @@ static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUF
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 2, 0};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 2, 1};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
 
@@ -870,9 +870,9 @@ int main(void) {
                 
                 /* Disable LED and microphone for deep sleep */
 
-                AudioMoth_setRedLED(false);
-
                 AudioMoth_disableMicrophone();
+
+                AudioMoth_setBothLED(false);
 
                 /* Enter deep sleep (EM2) */
 
