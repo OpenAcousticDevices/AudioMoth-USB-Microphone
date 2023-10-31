@@ -11,9 +11,9 @@
 
 #include "em_usb.h"
 
-#include "audioMoth.h"
+#include "audiomoth.h"
 #include "microphone.h"
-#include "digitalFilter.h"
+#include "digitalfilter.h"
 
 /* Useful time constants */
 
@@ -94,6 +94,12 @@
 
 #define USB_SERIAL_NUMBER_LENGTH                4
 #define BITS_PER_BCD_DIGIT                      4
+
+/* Serial number constants */
+
+#define SERIAL_NUMBER                           "%08X%08X"
+
+#define FORMAT_SERIAL_NUMBER(src)               (unsigned int)*((uint32_t*)src + 1),  (unsigned int)*((uint32_t*)src)
 
 /* Maths constants */
 
@@ -233,7 +239,7 @@ static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUF
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 2, 1};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 2, 2};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
 
@@ -283,23 +289,15 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     }
 
-    /* Update USB device release and serial number */
-
-    for (uint32_t i = 0; i < USB_STRING_DESCRIPTOR_SIZE; i += 1) serialDescriptor[i] = 0;
-
-    serialDescriptor[0] = CHAR16_SIZE_IN_BYTES * USB_SERIAL_NUMBER_LENGTH + CHAR16_SIZE_IN_BYTES;
-
-    serialDescriptor[1] = USB_STRING_DESCRIPTOR;
-
-    uint32_t sampleRate = effectiveSampleRate / HERTZ_IN_KILOHERTZ;
+    /* Update USB device release for sample rate */
 
     deviceDesc.bcdDevice = 0;
+
+    uint32_t sampleRate = effectiveSampleRate / HERTZ_IN_KILOHERTZ;
 
     for (uint32_t i = 0; i < USB_SERIAL_NUMBER_LENGTH; i += 1) {
 
         uint32_t digit = sampleRate % 10;
-
-        serialDescriptor[USB_STRING_DESCRIPTOR_OFFSET + 2 * (USB_SERIAL_NUMBER_LENGTH - i - 1)] = '0' + digit;
 
         deviceDesc.bcdDevice |= digit << (BITS_PER_BCD_DIGIT * i);
 
@@ -307,21 +305,37 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     }
 
+    /* Update USB serial number for sample rate and device unique ID */
+
+    for (uint32_t i = 0; i < USB_STRING_DESCRIPTOR_SIZE; i += 1) serialDescriptor[i] = 0;
+
+    uint32_t length = sprintf((char*)serialDescriptor + USB_STRING_DESCRIPTOR_OFFSET, "%04lu_" SERIAL_NUMBER, effectiveSampleRate / HERTZ_IN_KILOHERTZ, FORMAT_SERIAL_NUMBER(AM_UNIQUE_ID_START_ADDRESS));
+
+    serialDescriptor[0] = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
+
+    serialDescriptor[1] = USB_STRING_DESCRIPTOR;
+
+    char *src = (char*)serialDescriptor + USB_STRING_DESCRIPTOR_OFFSET;
+
+    char16_t *dst = (char16_t*)src;
+
+    for (uint32_t i = 0; i < length; i += 1) dst[length - 1 - i] = src[length - 1 - i];
+
     strings[USB_SERIAL_STRING_DESCRIPTOR_INDEX] = serialDescriptor;
 
     /* Update USB string descriptor for sample rate */
 
     for (uint32_t i = 0; i < USB_STRING_DESCRIPTOR_SIZE; i += 1) productDescriptor[i] = 0;
 
-    uint32_t length = sprintf((char*)productDescriptor + USB_STRING_DESCRIPTOR_OFFSET, "%lukHz AudioMoth USB Microphone", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
+    length = sprintf((char*)productDescriptor + USB_STRING_DESCRIPTOR_OFFSET, "%lukHz AudioMoth USB Microphone", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
 
     productDescriptor[0] = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
 
     productDescriptor[1] = USB_STRING_DESCRIPTOR;
 
-    char* src = (char*)productDescriptor + USB_STRING_DESCRIPTOR_OFFSET;
+    src = (char*)productDescriptor + USB_STRING_DESCRIPTOR_OFFSET;
 
-    char16_t* dst = (char16_t*)src;
+    dst = (char16_t*)src;
 
     for (uint32_t i = 0; i < length; i += 1) dst[length - 1 - i] = src[length - 1 - i];
 

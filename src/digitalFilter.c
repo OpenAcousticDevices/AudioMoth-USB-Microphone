@@ -1,5 +1,5 @@
 /****************************************************************************
- * digitalFilter.c
+ * digitalfilter.c
  * openacousticdevices.info
  * August 2021
  *****************************************************************************/
@@ -9,7 +9,7 @@
 #include <stdbool.h>
 #include <complex.h>
 
-#include "digitalFilter.h"
+#include "digitalfilter.h"
 
 /*  Useful macros */
 

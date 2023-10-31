@@ -210,7 +210,7 @@ STATIC_CONST_STRING_DESC(iManufacturer, 'o', 'p', 'e', 'n', 'a', 'c', 'o', 'u', 
 
 STATIC_CONST_STRING_DESC(iProduct, 'A', 'u', 'd', 'i', 'o', 'M', 'o', 't', 'h', ' ', 'U', 'S', 'B', ' ', 'M', 'i', 'c', 'r', 'o', 'p', 'h', 'o', 'n', 'e');
 
-STATIC_CONST_STRING_DESC(iSerialNumber, '0', '0', '0', '0');
+STATIC_CONST_STRING_DESC(iSerialNumber, '0', '0', '0', '0', '_', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0');
 
 /* End-point buffer sizes */
 
