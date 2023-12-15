@@ -17,6 +17,10 @@ The firmware implements two different USB configurations with a different number
 
 If building from the command line tools no further changes are necessary. However, if building using Simplicity Studio, open the project 'Properties' under the 'File' menu, navigate to the 'Linker' and 'Ordering' and make sure that the standard math library '-lm' is at the bottom of the list.
 
+### Documentation ####
+
+See the [Wiki](https://github.com/OpenAcousticDevices/AudioMoth-Firmware-Basic/wiki/AudioMoth) for detailed description of the example code.
+
 ### License ###
 
 Copyright 2021 [Open Acoustic Devices](http://www.openacousticdevices.info/).
