@@ -1,6 +1,8 @@
 # AudioMoth-USB-Microphone
 Additional firmware for AudioMoth devices to implement a streaming USB microphone.
 
+For more details, visit [AudioMoth USB Microphone](https://www.openacousticdevices.info/usb-microphone).
+
 Compatible with the [AudioMoth USB Microphone App](https://github.com/OpenAcousticDevices/AudioMoth-USB-Microphone-App).
 
 ### Usage ####
