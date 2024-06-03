@@ -25,6 +25,10 @@
 
 /* Useful type constant */
 
+/* Useful type constants */
+
+#define BITS_PER_BYTE                           8
+#define UINT32_SIZE_IN_BITS                     32
 #define UINT32_SIZE_IN_BYTES                    4
 #define CHAR16_SIZE_IN_BYTES                    2
 
@@ -32,6 +36,8 @@
 
 #define SHORT_LED_FLASH_DURATION                100
 #define DEFAULT_WAIT_INTERVAL                   200
+
+#define USB_CONFIGURATION_BLINK                 400
 
 /* Main loop delay constants */
 
@@ -95,6 +101,15 @@
 #define USB_SERIAL_NUMBER_LENGTH                4
 #define BITS_PER_BCD_DIGIT                      4
 
+/* HID configuration constants */
+
+#define HID_CONFIGURATION_MESSAGE               0x01
+#define HID_UPDATE_GAIN_MESSAGE                 0x02
+#define HID_SET_LED_MESSAGE                     0x03
+#define HID_RESTORE_MESSAGE                     0x04
+#define HID_READ_MESSAGE                        0x05
+#define HID_PERSIST_MESSAGE                     0x06
+
 /* Serial number constants */
 
 #define SERIAL_NUMBER                           "%08X%08X"
@@ -116,6 +131,14 @@
 #define MAX(a, b)                               ((a) > (b) ? (a) : (b))
 
 #define ROUND_UP_TO_MULTIPLE(a, b)              (((a) + (b) - 1) & ~((b)-1))
+
+/* Configuration and LED enums */
+
+typedef enum {LED_OFF, LED_FLASH, LED_SOLID} ledStatus_t;
+
+typedef enum {OVERRIDE_NONE, OVERRIDE_GAIN, OVERRIDE_ALL} overrideOption_t;
+
+typedef enum {ENUMERATE_NONE, ENUMERATE_BACKUP, ENUMERATE_PERSISTENT} enumerationRequired_t;
 
 /* USB configuration data structure */
 
@@ -155,7 +178,13 @@ static configSettings_t defaultConfigSettings = {
     .disableLED = 0
 };
 
-configSettings_t *configSettings = &defaultConfigSettings;
+/* Main and back-up domain configuration and enumeration flag */
+
+static uint32_t *enumerationRequired = (uint32_t*)AM_BACKUP_DOMAIN_START_ADDRESS;
+
+static configSettings_t *configSettings = (configSettings_t*)&defaultConfigSettings; 
+
+static configSettings_t *backupConfigSettings = (configSettings_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 4);
 
 /* Persistent configuration data structure */
 
@@ -169,6 +198,10 @@ typedef struct {
 
 #pragma pack(pop)
 
+/* Persistent configuration */
+
+static persistentConfigSettings_t persistentConfigSettings __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
+
 /* USB descriptors */
 
 static uint8_t productDescriptor[USB_STRING_DESCRIPTOR_SIZE] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
@@ -177,13 +210,9 @@ static uint8_t serialDescriptor[USB_STRING_DESCRIPTOR_SIZE] __attribute__ ((alig
 
 /* LED status */
 
-typedef enum {LED_NONE, LED_RED, LED_GREEN} ledColour_t;
+ledStatus_t redLED = LED_OFF;
 
-ledColour_t ledColour = LED_NONE;
-
-/* Switch state */
-
-AM_switchPosition_t switchPosition;
+ledStatus_t greenLED = LED_OFF;
 
 /* DMA transfer variable */
 
@@ -215,6 +244,16 @@ static uint16_t microphoneAlternative;
 
 static volatile bool microphoneChanged;
 
+static volatile bool microphoneHIDResponse;
+
+/* Configuration variables */
+
+static volatile overrideOption_t overrideOption;
+
+static volatile bool microphoneConfigurationChanged;
+
+static volatile bool writePersistentConfiguration;
+
 /* Sample buffer variables */
 
 static uint32_t readBuffer;
@@ -239,15 +278,51 @@ static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUF
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 2, 3};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 3, 0};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
+
+/* Microphone USB HID buffers */
+
+SL_ALIGN(4) static uint8_t microphoneHIDReceiveBuffer[2 * MICROPHONE_HID_BUFFER_SIZE];
+
+SL_ALIGN(4) static uint8_t microphoneHIDTransmitBuffer[2 * MICROPHONE_HID_BUFFER_SIZE];
 
 /* Function prototypes */
 
 int dataSentCallback(USB_Status_TypeDef status, uint32_t xferred, uint32_t remaining);
 
 int muteSettingReceivedCallback(USB_Status_TypeDef status, uint32_t xferred, uint32_t remaining);
+
+int dataSentMicrophoneHIDCallback(USB_Status_TypeDef status, uint32_t xferred, uint32_t remaining);
+
+int dataReceivedMicrophoneHIDCallback(USB_Status_TypeDef status, uint32_t xferred, uint32_t remaining);
+
+/* Functions of copy to and from the backup domain */
+
+static void copyFromBackupDomain(uint8_t *dst, uint32_t *src, uint32_t length) {
+
+    for (uint32_t i = 0; i < length; i += 1) {
+        *(dst + i) = *((uint8_t*)src + i);
+    }
+
+}
+
+static void copyToBackupDomain(uint32_t *dst, uint8_t *src, uint32_t length) {
+
+    uint32_t value = 0;
+
+    for (uint32_t i = 0; i < length / UINT32_SIZE_IN_BYTES; i += 1) {
+        *(dst + i) = *((uint32_t*)src + i);
+    }
+
+    for (uint32_t i = 0; i < length % UINT32_SIZE_IN_BYTES; i += 1) {
+        value = (value << BITS_PER_BYTE) + *(src + length - 1 - i);
+    }
+
+    if (length % UINT32_SIZE_IN_BYTES) *(dst + length / UINT32_SIZE_IN_BYTES) = value;
+
+}
 
 /* Set up buffers and microphone */
 
@@ -386,7 +461,7 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
 }
 
-void startMicrophoneSamples(bool useDefaultSetting) {
+void startMicrophoneSamples(bool useDefaultGainRange) {
 
     /* Initialise the counters */
     
@@ -402,7 +477,7 @@ void startMicrophoneSamples(bool useDefaultSetting) {
 
     /* Enable and start the microphone */
 
-    AM_gainRange_t gainRange = useDefaultSetting ? AM_NORMAL_GAIN_RANGE : configSettings->enableLowGainRange ? AM_LOW_GAIN_RANGE : AM_NORMAL_GAIN_RANGE;
+    AM_gainRange_t gainRange = useDefaultGainRange ? AM_NORMAL_GAIN_RANGE : configSettings->enableLowGainRange ? AM_LOW_GAIN_RANGE : AM_NORMAL_GAIN_RANGE;
 
     AudioMoth_enableMicrophone(gainRange, configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
 
@@ -430,21 +505,13 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     transferCount += 1;
 
-    bool ledStatus = !microphoneRestarting && transferCount < DMA_LED_ON_TIME;
+    bool redLEDState = microphoneRestarting == false && (redLED == LED_SOLID || (redLED == LED_FLASH && transferCount < DMA_LED_ON_TIME));
 
-    if (ledColour == LED_RED) {
+    bool greenLEDState = microphoneRestarting == false && (greenLED == LED_SOLID || (greenLED == LED_FLASH && transferCount < DMA_LED_ON_TIME));
 
-        AudioMoth_setRedLED(ledStatus);
+    AudioMoth_setRedLED(redLEDState);
 
-    } else if (ledColour == LED_GREEN) {
-
-        AudioMoth_setGreenLED(ledStatus);
-
-    } else {
-
-        AudioMoth_setBothLED(false);
-
-    }
+    AudioMoth_setGreenLED(greenLEDState);
 
     if (transferCount > transferPeriod) transferCount = 0;
 
@@ -468,17 +535,21 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
 }
 
-/* Provide data for the USB microphone */
+/* Callback on completion of USB state change */
 
 static void stateChange(USBD_State_TypeDef oldState, USBD_State_TypeDef newState) {
 
     if (newState == USBD_STATE_CONFIGURED) {
 
         USBD_Write(MICROPHONE_EP_IN, silentBuffer, numberOfSamplesInBuffer * NUMBER_OF_BYTES_IN_SAMPLE, dataSentCallback);
+        
+        USBD_Read(HID_EP_OUT, microphoneHIDReceiveBuffer, MICROPHONE_HID_BUFFER_SIZE, dataReceivedMicrophoneHIDCallback);
 
     } else if (oldState == USBD_STATE_CONFIGURED) {
-    
+
         USBD_AbortTransfer(MICROPHONE_EP_IN);
+
+        USBD_AbortTransfer(HID_EP_OUT);
 
     }
 
@@ -544,8 +615,30 @@ static int setupCmd(const USB_Setup_TypeDef *setup) {
       
             retVal = USBD_Write(0, buffer, 1, NULL);
 
-        }
+        } else if (setup->bRequest == GET_DESCRIPTOR) {
         
+            switch (setup->wValue >> 8) {
+
+                case USB_HID_REPORT_DESCRIPTOR:
+
+                    USBD_Write(0x00, (void*)HID_ReportDescriptor, SL_MIN(sizeof(HID_ReportDescriptor), setup->wLength), NULL);
+
+                    retVal = USB_STATUS_OK;
+
+                    break;
+
+                case USB_HID_DESCRIPTOR:
+
+                    USBD_Write(0x00, (void*)HID_Descriptor, SL_MIN(sizeof(HID_Descriptor), setup->wLength), NULL);
+
+                    retVal = USB_STATUS_OK;
+
+                    break;
+
+            }
+        
+        }
+    
     }
 
     return retVal;
@@ -641,6 +734,158 @@ int muteSettingReceivedCallback(USB_Status_TypeDef status, uint32_t xferred, uin
 
 }
 
+/* Callbacks on completion of microphone HID data send and receive */
+
+int dataSentMicrophoneHIDCallback(USB_Status_TypeDef status, uint32_t xferred, uint32_t remaining) {
+
+    USBD_Read(HID_EP_OUT, microphoneHIDReceiveBuffer, MICROPHONE_HID_BUFFER_SIZE, dataReceivedMicrophoneHIDCallback);
+
+    return USB_STATUS_OK;
+
+}
+
+int dataReceivedMicrophoneHIDCallback(USB_Status_TypeDef status, uint32_t xferred, uint32_t remaining) {
+
+    /* Clear transmit buffer and copy message type */
+
+    memset(microphoneHIDTransmitBuffer, 0, MICROPHONE_HID_BUFFER_SIZE);
+
+    /* Get a pointer to the received configuration */
+
+    configSettings_t *receivedConfiguration = (configSettings_t*)(microphoneHIDReceiveBuffer + 1);
+
+    /* Configure microphone */
+
+    if (microphoneHIDReceiveBuffer[0] == HID_CONFIGURATION_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Copy received configuration to transmit buffer */
+
+        memcpy(microphoneHIDTransmitBuffer + 1, receivedConfiguration, sizeof(configSettings_t));
+
+        /* Reset enable LED option */
+
+        receivedConfiguration->disableLED = configSettings->disableLED;
+
+        /* Copy configuration and set flags */
+
+        bool enumerate = receivedConfiguration->sampleRate != configSettings->sampleRate || receivedConfiguration->sampleRateDivider != configSettings->sampleRateDivider;
+
+        if (enumerate) {
+
+            copyToBackupDomain((uint32_t*)backupConfigSettings, (uint8_t*)receivedConfiguration, sizeof(configSettings_t));
+
+            *enumerationRequired = ENUMERATE_BACKUP;
+
+        } else {
+
+            memcpy(configSettings, receivedConfiguration, sizeof(configSettings_t));
+
+        }
+
+        microphoneConfigurationChanged = true;
+
+        overrideOption = OVERRIDE_ALL;
+
+    } else if (microphoneHIDReceiveBuffer[0] == HID_UPDATE_GAIN_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Copy received configuration to transmit buffer */
+
+        memcpy(microphoneHIDTransmitBuffer + 1, receivedConfiguration, sizeof(configSettings_t));
+
+        /* Copy configuration and set flags */
+
+        configSettings->gain = receivedConfiguration->gain;
+
+        configSettings->enableLowGainRange = receivedConfiguration->enableLowGainRange;
+
+        microphoneConfigurationChanged = true;
+
+        if (overrideOption == OVERRIDE_NONE) overrideOption = OVERRIDE_GAIN;
+
+    } else if (microphoneHIDReceiveBuffer[0] == HID_SET_LED_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Copy received configuration to transmit buffer */
+
+        memcpy(microphoneHIDTransmitBuffer + 1, receivedConfiguration, sizeof(configSettings_t));
+
+        /* Copy led state and set flags */
+
+        configSettings->disableLED = receivedConfiguration->disableLED;
+
+        microphoneConfigurationChanged = true;
+
+    } else if (microphoneHIDReceiveBuffer[0] == HID_RESTORE_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Copy configuration from persistent storage and set flags */
+
+        persistentConfigSettings_t *persistentConfigSettings = (persistentConfigSettings_t*)AM_FLASH_USER_DATA_ADDRESS;
+
+        bool enumerate = persistentConfigSettings->configSettings.sampleRate != configSettings->sampleRate || persistentConfigSettings->configSettings.sampleRateDivider != configSettings->sampleRateDivider;
+
+        if (enumerate) {
+            
+            *enumerationRequired = ENUMERATE_PERSISTENT;
+
+        } else {
+
+            memcpy(configSettings, &persistentConfigSettings->configSettings, sizeof(configSettings_t));
+
+        }
+
+        microphoneConfigurationChanged = true;
+
+        overrideOption = OVERRIDE_NONE;
+
+    } else if (microphoneHIDReceiveBuffer[0] == HID_READ_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Copy current configuration to transmit buffer */
+
+        memcpy(microphoneHIDTransmitBuffer + 1, configSettings, sizeof(configSettings_t));
+
+    } else if (microphoneHIDReceiveBuffer[0] == HID_PERSIST_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Set flags */
+
+        writePersistentConfiguration = true;
+
+        microphoneConfigurationChanged = true;
+
+        overrideOption = OVERRIDE_NONE;
+
+    }
+
+    /* Send the response */
+
+    USBD_Write(HID_EP_IN, microphoneHIDTransmitBuffer, MICROPHONE_HID_BUFFER_SIZE, dataSentMicrophoneHIDCallback);
+
+    return USB_STATUS_OK;
+
+}
+
 /* AudioMoth USB message handlers */
 
 inline void AudioMoth_usbFirmwareVersionRequested(uint8_t **firmwareVersionPtr) {
@@ -663,17 +908,19 @@ inline void AudioMoth_usbApplicationPacketRequested(uint32_t messageType, uint8_
 
 inline void AudioMoth_usbApplicationPacketReceived(uint32_t messageType, uint8_t* receiveBuffer, uint8_t *transmitBuffer, uint32_t size) {
 
-    /* Make persistent configuration settings data structure */
+    /* Get the received configuration */
 
-    static persistentConfigSettings_t persistentConfigSettings __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
+    configSettings_t *receivedConfiguration = (configSettings_t*)(receiveBuffer + 1);
+
+    /* Make persistent configuration settings data structure */
 
     memcpy(&persistentConfigSettings.firmwareVersion, &firmwareVersion, AM_FIRMWARE_VERSION_LENGTH);
 
     memcpy(&persistentConfigSettings.firmwareDescription, &firmwareDescription, AM_FIRMWARE_DESCRIPTION_LENGTH);
 
-    memcpy(&persistentConfigSettings.configSettings, receiveBuffer + 1,  sizeof(configSettings_t));
+    memcpy(&persistentConfigSettings.configSettings, receivedConfiguration, sizeof(configSettings_t));
 
-    /* Copy persistent configuration settings to flash */
+    /* Copy received configuration settings to flash */
 
     uint32_t numberOfBytes = ROUND_UP_TO_MULTIPLE(sizeof(persistentConfigSettings_t), UINT32_SIZE_IN_BYTES);
 
@@ -681,17 +928,21 @@ inline void AudioMoth_usbApplicationPacketReceived(uint32_t messageType, uint8_t
 
     if (success) {
 
-        /* Copy the USB packet contents to current configuration settings */
+        /* Copy received configuration to the current configuration */
 
-        memcpy(configSettings,  &persistentConfigSettings.configSettings, sizeof(configSettings_t));
+        memcpy(configSettings, &persistentConfigSettings.configSettings, sizeof(configSettings_t));
 
         /* Copy the current configuration settings to the USB packet */
 
-        memcpy(transmitBuffer + 1, configSettings, sizeof(configSettings_t)); 
+        memcpy(transmitBuffer + 1, &persistentConfigSettings.configSettings, sizeof(configSettings_t));
 
         /* Set the time */
 
         AudioMoth_setTime(configSettings->time, USB_CONFIG_TIME_CORRECTION);
+
+        /* Blink the green LED */
+
+        AudioMoth_blinkDuringUSB(USB_CONFIGURATION_BLINK);
 
     } else {
 
@@ -703,6 +954,116 @@ inline void AudioMoth_usbApplicationPacketReceived(uint32_t messageType, uint8_t
 
 }
 
+/* Function to determine LED colours */
+
+void setLED(AM_switchPosition_t switchPosition) {
+
+    if (configSettings->disableLED) {
+
+        redLED = LED_OFF;
+        
+        greenLED = LED_OFF;
+
+    } else if (overrideOption == OVERRIDE_NONE) {
+
+        redLED = switchPosition == AM_SWITCH_CUSTOM ? LED_FLASH : LED_OFF;
+
+        greenLED = switchPosition == AM_SWITCH_DEFAULT ? LED_FLASH : LED_OFF;
+
+    } else if (overrideOption == OVERRIDE_GAIN) {
+
+        persistentConfigSettings_t *persistentConfigSettings = (persistentConfigSettings_t*)AM_FLASH_USER_DATA_ADDRESS;
+
+        bool configurationChange = configSettings->gain != persistentConfigSettings->configSettings.gain || configSettings->enableLowGainRange != persistentConfigSettings->configSettings.enableLowGainRange;
+
+        if (switchPosition == AM_SWITCH_CUSTOM) {
+
+            redLED = LED_FLASH;
+
+            greenLED = configurationChange ? LED_SOLID : LED_OFF;
+
+        } else {
+
+            redLED = configurationChange ? LED_SOLID : LED_OFF;
+
+            greenLED = LED_FLASH;
+
+        }
+
+    } else {
+
+        redLED = LED_FLASH;
+
+        greenLED = LED_FLASH;
+
+    }
+
+}
+
+/* Function to restart microphone samples */
+
+void restartMicrophoneSamples(AM_switchPosition_t switchPosition, bool setup, uint32_t delay) {
+
+    /* Stop the LED */
+
+    redLED = LED_OFF;
+
+    greenLED = LED_OFF;
+
+    AudioMoth_setBothLED(false);
+
+    /* Restart with current microphone settings */
+
+    microphoneRestarting = true;
+
+    AudioMoth_disableMicrophone();
+
+    if (writePersistentConfiguration) {
+
+        /* Make persistent configuration settings data structure */
+
+        memcpy(&persistentConfigSettings.firmwareVersion, &firmwareVersion, AM_FIRMWARE_VERSION_LENGTH);
+
+        memcpy(&persistentConfigSettings.firmwareDescription, &firmwareDescription, AM_FIRMWARE_DESCRIPTION_LENGTH);
+
+        memcpy(&persistentConfigSettings.configSettings, configSettings, sizeof(configSettings_t));
+
+        /* Copy current settings to flash */
+
+        uint32_t numberOfBytes = ROUND_UP_TO_MULTIPLE(sizeof(persistentConfigSettings_t), UINT32_SIZE_IN_BYTES);
+
+        AudioMoth_writeToFlashUserDataPage((uint8_t*)&persistentConfigSettings, numberOfBytes);
+
+        /* Wait and reset flag */
+
+        AudioMoth_delay(DEFAULT_DELAY_INTERVAL / 2);
+
+        writePersistentConfiguration = false;
+   
+    } else {
+
+        AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
+
+    }
+
+    bool useDefaultSetting = (overrideOption == OVERRIDE_NONE || overrideOption == OVERRIDE_GAIN) && switchPosition == AM_SWITCH_DEFAULT;
+
+    if (setup) setUpMicrophone(useDefaultSetting);
+
+    bool useDefaultGainRange = overrideOption == OVERRIDE_NONE && switchPosition == AM_SWITCH_DEFAULT;
+
+    startMicrophoneSamples(useDefaultGainRange);
+
+    AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
+
+    microphoneRestarting = false;
+
+    /* Restart the LED */
+
+    setLED(switchPosition);
+
+}
+
 /* Main function */
 
 int main(void) {
@@ -711,17 +1072,55 @@ int main(void) {
 
     AudioMoth_initialise();
 
-    /* Check the persistent configuration */
+    /* Reset enumeration flag if this is an initial power up */
 
-    persistentConfigSettings_t *persistentConfigSettings = (persistentConfigSettings_t*)AM_FLASH_USER_DATA_ADDRESS;
+    if (AudioMoth_isInitialPowerUp()) *enumerationRequired = ENUMERATE_NONE;
 
-    if (memcmp(persistentConfigSettings->firmwareVersion, firmwareVersion, AM_FIRMWARE_VERSION_LENGTH) == 0 && memcmp(persistentConfigSettings->firmwareDescription, firmwareDescription, AM_FIRMWARE_DESCRIPTION_LENGTH) == 0) {
+    /* Restore the backup or persistent configuration */
 
-        memcpy(configSettings, &persistentConfigSettings->configSettings, sizeof(configSettings_t));
+    if (*enumerationRequired == ENUMERATE_BACKUP) {
+
+        copyFromBackupDomain((uint8_t*)configSettings, (uint32_t*)backupConfigSettings, sizeof(configSettings_t));
+
+        overrideOption = OVERRIDE_ALL;
+
+    } else {
+
+        persistentConfigSettings_t *persistentConfigSettings = (persistentConfigSettings_t*)AM_FLASH_USER_DATA_ADDRESS;
+
+        if (memcmp(persistentConfigSettings->firmwareVersion, firmwareVersion, AM_FIRMWARE_VERSION_LENGTH) == 0 && memcmp(persistentConfigSettings->firmwareDescription, firmwareDescription, AM_FIRMWARE_DESCRIPTION_LENGTH) == 0) {
+
+            /* Copy persistent configuration to current configuration */
+
+            memcpy(configSettings, &persistentConfigSettings->configSettings, sizeof(configSettings_t));
+
+        } else {
+
+            /* Copy default configuration settings to persistent configuration */
+
+            static persistentConfigSettings_t persistentConfigSettings __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
+
+            memcpy(&persistentConfigSettings.firmwareVersion, &firmwareVersion, AM_FIRMWARE_VERSION_LENGTH);
+
+            memcpy(&persistentConfigSettings.firmwareDescription, &firmwareDescription, AM_FIRMWARE_DESCRIPTION_LENGTH);
+
+            memcpy(&persistentConfigSettings.configSettings, configSettings, sizeof(configSettings_t));
+
+            uint32_t numberOfBytes = ROUND_UP_TO_MULTIPLE(sizeof(persistentConfigSettings_t), UINT32_SIZE_IN_BYTES);
+
+            AudioMoth_writeToFlashUserDataPage((uint8_t*)&persistentConfigSettings, numberOfBytes);
+
+        }
+
+        overrideOption = OVERRIDE_NONE;
 
     }
 
-    /* Read the switch state */
+    /* Reset enumeration flag after possibly restoring configuration */
+
+    *enumerationRequired = ENUMERATE_NONE;
+
+    /* Respond to switch state */
 
     AM_switchPosition_t switchPosition = AudioMoth_getSwitchPosition();
 
@@ -755,27 +1154,33 @@ int main(void) {
 
         /* Set LED colour */
 
-        ledColour = configSettings->disableLED ? LED_NONE : switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
+        setLED(switchPosition);
 
         /* Start the microphone samples */
 
         AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
 
-        setUpMicrophone(switchPosition == AM_SWITCH_DEFAULT);
+        bool useDefaultSetting = (overrideOption == OVERRIDE_NONE || overrideOption == OVERRIDE_GAIN) && switchPosition == AM_SWITCH_DEFAULT;
 
-        startMicrophoneSamples(switchPosition == AM_SWITCH_DEFAULT);
+        setUpMicrophone(useDefaultSetting);
+
+        bool useDefaultGainRange = overrideOption == OVERRIDE_NONE && switchPosition == AM_SWITCH_DEFAULT;
+
+        startMicrophoneSamples(useDefaultGainRange);
 
         /* Enable the USB interface */
 
         USBD_Init(&initstruct);
 
-        /* Initial the real time clock and enter loop */
+        /* Initialise the real time clock and enter loop */
 
         bool cancel = false;
 
         uint32_t usbCounter = 0;
 
         uint32_t switchChangeCounter = 0;
+
+        microphoneHIDResponse = false;
 
         AudioMoth_startRealTimeClock(USB_EM2_RTC_WAKEUP_INTERVAL);
 
@@ -785,17 +1190,13 @@ int main(void) {
 
             AM_switchPosition_t currentSwitchPosition = AudioMoth_getSwitchPosition();
 
-            /* Check for USB switch change */
+            /* Check for switch change to USB/OFF or configuration change requiring re-enumeration  and then exit the loop */
 
-            usbCounter = currentSwitchPosition == AM_SWITCH_USB ? usbCounter + 1 : 0;
+            usbCounter = currentSwitchPosition == AM_SWITCH_USB || (microphoneConfigurationChanged && *enumerationRequired != ENUMERATE_NONE) ? usbCounter + 1 : 0;
  
-            if (usbCounter > USB_DELAY_COUNT) {
+            if (usbCounter > USB_DELAY_COUNT) cancel = true;
 
-                cancel = true;
-
-            }
-
-            /* Check if microphone settings change required */
+            /* Check for switch change between DEFAULT and CUSTOM */
 
             switchChangeCounter = ((switchPosition == AM_SWITCH_DEFAULT && currentSwitchPosition == AM_SWITCH_CUSTOM) \
                                     || (switchPosition == AM_SWITCH_CUSTOM && currentSwitchPosition == AM_SWITCH_DEFAULT)) ? switchChangeCounter + 1 : 0;
@@ -806,33 +1207,9 @@ int main(void) {
 
                 switchPosition = currentSwitchPosition;
 
-                /* Stop the LED */
+                /* Restart the microphone samples */
 
-                ledColour = LED_NONE;
-
-                AudioMoth_setBothLED(false);
-
-                /* Restart with current microphone settings */
-
-                microphoneRestarting = true;
-
-                AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
-
-                AudioMoth_disableMicrophone();
-
-                AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
-
-                setUpMicrophone(switchPosition == AM_SWITCH_DEFAULT);
-
-                startMicrophoneSamples(switchPosition == AM_SWITCH_DEFAULT);
-
-                AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
-
-                microphoneRestarting = false;
-
-                /* Restart the LED */
-
-                ledColour = configSettings->disableLED ? LED_NONE : switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
+                restartMicrophoneSamples(switchPosition, true, DEFAULT_DELAY_INTERVAL);
 
                 /* Reset counter */
 
@@ -844,35 +1221,33 @@ int main(void) {
 
             if (microphoneChanged) {
 
-                /* Stop the LED */
+                /* Restart the microphone samples */
 
-                ledColour = LED_NONE;
+                restartMicrophoneSamples(switchPosition, false, MICROPHONE_CHANGE_INTERVAL);
 
-                AudioMoth_setBothLED(false);
-
-                /* Restart with current microphone settings */
-
-                microphoneRestarting = true;
-
-                AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
-
-                AudioMoth_disableMicrophone();
-
-                AudioMoth_delay(MICROPHONE_CHANGE_INTERVAL);
-
-                startMicrophoneSamples(switchPosition == AM_SWITCH_DEFAULT);
-
-                AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
-
-                microphoneRestarting = false;
+                /* Reset flag */
 
                 microphoneChanged = false;
 
-                /* Restart the LED */
+            }
 
-                ledColour = configSettings->disableLED ? LED_NONE : switchPosition == AM_SWITCH_DEFAULT ? LED_GREEN : LED_RED;
+            /* Handle configuration change that does not require re-enumeration */
+
+            if (microphoneConfigurationChanged && *enumerationRequired == ENUMERATE_NONE) {
+
+                /* Restart the microphone samples */
+
+                restartMicrophoneSamples(switchPosition, true, DEFAULT_DELAY_INTERVAL);
+
+                /* Reset flag */
+
+                microphoneConfigurationChanged = false;
 
             }
+
+            /* Handle persistent write */
+
+            if (writePersistentConfiguration) cancel = true;
 
             /* Check and handle time overflow */
 
@@ -894,7 +1269,9 @@ int main(void) {
 
                 /* Restart microphone samples */
 
-                startMicrophoneSamples(switchPosition == AM_SWITCH_DEFAULT);
+                bool useDefaultGainRange = overrideOption == OVERRIDE_NONE && switchPosition == AM_SWITCH_DEFAULT;
+
+                startMicrophoneSamples(useDefaultGainRange);
 
             }
 
@@ -904,23 +1281,21 @@ int main(void) {
 
         }
 
-        /* Disable real time clock */
-
-        AudioMoth_stopRealTimeClock();
-
-        /* Disable USB */
-
-        USBD_AbortAllTransfers();
-
-        USBD_Stop();
-
-        USBD_Disconnect();
-
         /* Disable the microphone */
 
         AudioMoth_disableMicrophone();
 
+        /* Disconnect USB */
+
+        USBD_Disconnect();
+
+        /* Disable real time clock */
+
+        AudioMoth_stopRealTimeClock();
+
     }
+
+    /* Handle persistent write */
 
     /* Turn off LED */
 
