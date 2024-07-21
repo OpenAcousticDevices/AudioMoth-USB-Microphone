@@ -10,6 +10,8 @@
 #include <stdbool.h>
 
 #include "em_usb.h"
+#include "em_gpio.h"
+#include "em_wdog.h"
 
 #include "audiomoth.h"
 #include "microphone.h"
@@ -22,8 +24,6 @@
 /* Useful frequency constants */
 
 #define HERTZ_IN_KILOHERTZ                      1000
-
-/* Useful type constant */
 
 /* Useful type constants */
 
@@ -43,7 +43,7 @@
 
 #define MAIN_LOOP_WAIT_INTERVAL                 10
 #define DEFAULT_DELAY_INTERVAL                  100
-#define MICROPHONE_CHANGE_INTERVAL              2000
+#define MICROPHONE_CHANGE_INTERVAL              400
 
 /* USB EM2 wake constant */
 
@@ -109,6 +109,8 @@
 #define HID_RESTORE_MESSAGE                     0x04
 #define HID_READ_MESSAGE                        0x05
 #define HID_PERSIST_MESSAGE                     0x06
+#define HID_FIRMARE_MESSAGE                     0x07
+#define HID_BOOTLOADER_MESSAGE                  0x08
 
 /* Serial number constants */
 
@@ -246,6 +248,8 @@ static volatile bool microphoneChanged;
 
 static volatile bool microphoneHIDResponse;
 
+static volatile bool enterSerialBootloader;
+
 /* Configuration variables */
 
 static volatile overrideOption_t overrideOption;
@@ -278,7 +282,7 @@ static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUF
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 3, 0};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 3, 1};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
 
@@ -324,9 +328,9 @@ static void copyToBackupDomain(uint32_t *dst, uint8_t *src, uint32_t length) {
 
 }
 
-/* Set up buffers and microphone */
+/* Set up buffers and microphone and start the microphone samples */
 
-static void setUpMicrophone(bool useDefaultSetting) {
+static void setupAndStartMicrophoneSamples(bool useDefaultSetting, bool useDefaultGainRange) {
 
     /* Calculate effective sample rate */
 
@@ -340,7 +344,7 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     bool energySaverMode = configSettings->enableEnergySaverMode && effectiveSampleRate <= ENERGY_SAVER_SAMPLE_RATE_THRESHOLD;
 
-    energySaverFactor = !useDefaultSetting && energySaverMode ? 2 : 1;
+    energySaverFactor = useDefaultSetting == false && energySaverMode ? 2 : 1;
 
     /* Calculate the number of samples in each buffer and DMA transfer */
 
@@ -356,7 +360,7 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
             for (uint32_t j = 0; j < numberOfSamplesInBuffer; j += 1) {
 
-                sineBuffers[i][j] = (int16_t)((float)INT16_MAX / 2.0f * sinf(M_TWOPI * (float)(i * numberOfSamplesInBuffer + j) / (float)NUMBER_OF_SINE_BUFFERS / (float)numberOfSamplesInBuffer));
+                sineBuffers[i][j] = (int16_t)roundf((float)INT16_MAX / 2.0f * sinf(M_TWOPI * (float)(i * numberOfSamplesInBuffer + j) / (float)NUMBER_OF_SINE_BUFFERS / (float)numberOfSamplesInBuffer));
 
             }
 
@@ -431,7 +435,7 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     DigitalFilter_reset();
 
-    uint32_t blockingFilterFrequency = !useDefaultSetting && configSettings->disable48HzDCBlockingFilter ? LOW_DC_BLOCKING_FREQ : DEFAULT_DC_BLOCKING_FREQ;
+    uint32_t blockingFilterFrequency = useDefaultSetting == false && configSettings->disable48HzDCBlockingFilter ? LOW_DC_BLOCKING_FREQ : DEFAULT_DC_BLOCKING_FREQ;
 
     if (useDefaultSetting || (configSettings->lowerFilterFreq == 0 && configSettings->higherFilterFreq == 0)) {
 
@@ -451,18 +455,6 @@ static void setUpMicrophone(bool useDefaultSetting) {
 
     }
 
-    /* Calculate the sample multiplier */
-
-    float sampleMultiplier = 16.0f / (float)(configSettings->oversampleRate * configSettings->sampleRateDivider / energySaverFactor);
-
-    if (AudioMoth_hasInvertedOutput()) sampleMultiplier = -sampleMultiplier;
-
-    DigitalFilter_applyAdditionalGain(sampleMultiplier);
-
-}
-
-void startMicrophoneSamples(bool useDefaultGainRange) {
-
     /* Initialise the counters */
     
     readBuffer = 0;
@@ -475,13 +467,25 @@ void startMicrophoneSamples(bool useDefaultGainRange) {
 
     memset(sampleBuffer, 0, sizeof(sampleBuffer));
 
-    /* Enable and start the microphone */
+    /* Enable the microphone and initialise direct memory access */
 
     AM_gainRange_t gainRange = useDefaultGainRange ? AM_NORMAL_GAIN_RANGE : configSettings->enableLowGainRange ? AM_LOW_GAIN_RANGE : AM_NORMAL_GAIN_RANGE;
 
-    AudioMoth_enableMicrophone(gainRange, configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
+    bool externalMicrophone = AudioMoth_enableMicrophone(gainRange, configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
 
     AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, numberOfRawSamplesInDMATransfer);
+
+    /* Calculate the sample multiplier */
+
+    float sampleMultiplier = 16.0f / (float)(configSettings->oversampleRate * configSettings->sampleRateDivider / energySaverFactor);
+
+    if (AudioMoth_hasInvertedOutput()) sampleMultiplier = -sampleMultiplier;
+
+    if (externalMicrophone) sampleMultiplier = -sampleMultiplier;
+
+    DigitalFilter_applyAdditionalGain(sampleMultiplier);
+
+    /* Start the samples */
 
     AudioMoth_startMicrophoneSamples(configSettings->sampleRate / energySaverFactor);
 
@@ -876,6 +880,28 @@ int dataReceivedMicrophoneHIDCallback(USB_Status_TypeDef status, uint32_t xferre
 
         overrideOption = OVERRIDE_NONE;
 
+    } else if (microphoneHIDReceiveBuffer[0] == HID_FIRMARE_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Copy firmware version and description to transmit buffer */
+
+        memcpy(microphoneHIDTransmitBuffer + 1, firmwareVersion, AM_FIRMWARE_VERSION_LENGTH);
+
+        memcpy(microphoneHIDTransmitBuffer + 1 + AM_FIRMWARE_VERSION_LENGTH, firmwareDescription, AM_FIRMWARE_DESCRIPTION_LENGTH);
+
+    } else if (microphoneHIDReceiveBuffer[0] == HID_BOOTLOADER_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Set flag */
+
+        enterSerialBootloader = true;
+
     }
 
     /* Send the response */
@@ -1002,7 +1028,7 @@ void setLED(AM_switchPosition_t switchPosition) {
 
 /* Function to restart microphone samples */
 
-void restartMicrophoneSamples(AM_switchPosition_t switchPosition, bool setup, uint32_t delay) {
+void restartMicrophoneSamples(AM_switchPosition_t switchPosition, uint32_t delay) {
 
     /* Stop the LED */
 
@@ -1034,25 +1060,19 @@ void restartMicrophoneSamples(AM_switchPosition_t switchPosition, bool setup, ui
 
         AudioMoth_writeToFlashUserDataPage((uint8_t*)&persistentConfigSettings, numberOfBytes);
 
-        /* Wait and reset flag */
-
-        AudioMoth_delay(DEFAULT_DELAY_INTERVAL / 2);
+        /* Reset flag */
 
         writePersistentConfiguration = false;
    
-    } else {
-
-        AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
-
     }
+
+    AudioMoth_delay(delay);
 
     bool useDefaultSetting = (overrideOption == OVERRIDE_NONE || overrideOption == OVERRIDE_GAIN) && switchPosition == AM_SWITCH_DEFAULT;
 
-    if (setup) setUpMicrophone(useDefaultSetting);
-
     bool useDefaultGainRange = overrideOption == OVERRIDE_NONE && switchPosition == AM_SWITCH_DEFAULT;
 
-    startMicrophoneSamples(useDefaultGainRange);
+    setupAndStartMicrophoneSamples(useDefaultSetting, useDefaultGainRange);
 
     AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
 
@@ -1130,176 +1150,230 @@ int main(void) {
 
         AudioMoth_handleUSB();
 
-    } else {
+        /* Power down */
 
-        /* Set up audio buffers */
-
-        buffers[0] = (int16_t*)sampleBuffer;
-
-        for (uint32_t i = 1; i < NUMBER_OF_BUFFERS; i += 1) {
-            buffers[i] = buffers[i - 1] + MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER / NUMBER_OF_BYTES_IN_SAMPLE;
-        }
-
-        /* Set up debug sine buffers */
-
-        if (GENERATE_SINE_WAVE) {
-
-            sineBuffers[0] = (int16_t*)sineBuffer;
-
-            for (uint32_t i = 1; i < NUMBER_OF_SINE_BUFFERS; i += 1) {
-                sineBuffers[i] = sineBuffers[i - 1] + MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER / NUMBER_OF_BYTES_IN_SAMPLE;
-            }
-
-        }
-
-        /* Set LED colour */
-
-        setLED(switchPosition);
-
-        /* Start the microphone samples */
-
-        AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
-
-        bool useDefaultSetting = (overrideOption == OVERRIDE_NONE || overrideOption == OVERRIDE_GAIN) && switchPosition == AM_SWITCH_DEFAULT;
-
-        setUpMicrophone(useDefaultSetting);
-
-        bool useDefaultGainRange = overrideOption == OVERRIDE_NONE && switchPosition == AM_SWITCH_DEFAULT;
-
-        startMicrophoneSamples(useDefaultGainRange);
-
-        /* Enable the USB interface */
-
-        USBD_Init(&initstruct);
-
-        /* Initialise the real time clock and enter loop */
-
-        bool cancel = false;
-
-        uint32_t usbCounter = 0;
-
-        uint32_t switchChangeCounter = 0;
-
-        microphoneHIDResponse = false;
-
-        AudioMoth_startRealTimeClock(USB_EM2_RTC_WAKEUP_INTERVAL);
-
-        while (!cancel) { 
-
-            /* Check for switch change */
-
-            AM_switchPosition_t currentSwitchPosition = AudioMoth_getSwitchPosition();
-
-            /* Check for switch change to USB/OFF or configuration change requiring re-enumeration  and then exit the loop */
-
-            usbCounter = currentSwitchPosition == AM_SWITCH_USB || (microphoneConfigurationChanged && *enumerationRequired != ENUMERATE_NONE) ? usbCounter + 1 : 0;
- 
-            if (usbCounter > USB_DELAY_COUNT) cancel = true;
-
-            /* Check for switch change between DEFAULT and CUSTOM */
-
-            switchChangeCounter = ((switchPosition == AM_SWITCH_DEFAULT && currentSwitchPosition == AM_SWITCH_CUSTOM) \
-                                    || (switchPosition == AM_SWITCH_CUSTOM && currentSwitchPosition == AM_SWITCH_DEFAULT)) ? switchChangeCounter + 1 : 0;
-
-            if (switchChangeCounter > SWITCH_DEBOUNCE_COUNT) {
-
-                /* Update switch position */
-
-                switchPosition = currentSwitchPosition;
-
-                /* Restart the microphone samples */
-
-                restartMicrophoneSamples(switchPosition, true, DEFAULT_DELAY_INTERVAL);
-
-                /* Reset counter */
-
-                switchChangeCounter = 0;
-
-            }
-
-            /* Handle microphone change */
-
-            if (microphoneChanged) {
-
-                /* Restart the microphone samples */
-
-                restartMicrophoneSamples(switchPosition, false, MICROPHONE_CHANGE_INTERVAL);
-
-                /* Reset flag */
-
-                microphoneChanged = false;
-
-            }
-
-            /* Handle configuration change that does not require re-enumeration */
-
-            if (microphoneConfigurationChanged && *enumerationRequired == ENUMERATE_NONE) {
-
-                /* Restart the microphone samples */
-
-                restartMicrophoneSamples(switchPosition, true, DEFAULT_DELAY_INTERVAL);
-
-                /* Reset flag */
-
-                microphoneConfigurationChanged = false;
-
-            }
-
-            /* Handle persistent write */
-
-            if (writePersistentConfiguration) cancel = true;
-
-            /* Check and handle time overflow */
-
-            AudioMoth_checkAndHandleTimeOverflow();
-
-            /* Enter low power standby if USB is unplugged */
-
-            if (USBD_SafeToEnterEM2()) {
-                
-                /* Disable LED and microphone for deep sleep */
-
-                AudioMoth_disableMicrophone();
-
-                AudioMoth_setBothLED(false);
-
-                /* Enter deep sleep (EM2) */
-
-                AudioMoth_deepSleep();
-
-                /* Restart microphone samples */
-
-                bool useDefaultGainRange = overrideOption == OVERRIDE_NONE && switchPosition == AM_SWITCH_DEFAULT;
-
-                startMicrophoneSamples(useDefaultGainRange);
-
-            }
-
-            /* Sleep until next interrupt */
-
-            AudioMoth_delay(MAIN_LOOP_WAIT_INTERVAL);
-
-        }
-
-        /* Disable the microphone */
-
-        AudioMoth_disableMicrophone();
-
-        /* Disconnect USB */
-
-        USBD_Disconnect();
-
-        /* Disable real time clock */
-
-        AudioMoth_stopRealTimeClock();
+        AudioMoth_powerDownAndWakeMilliseconds(DEFAULT_WAIT_INTERVAL);
 
     }
 
-    /* Handle persistent write */
+    /* Set up audio buffers */
+
+    buffers[0] = (int16_t*)sampleBuffer;
+
+    for (uint32_t i = 1; i < NUMBER_OF_BUFFERS; i += 1) {
+        buffers[i] = buffers[i - 1] + MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER / NUMBER_OF_BYTES_IN_SAMPLE;
+    }
+
+    /* Set up debug sine buffers */
+
+    if (GENERATE_SINE_WAVE) {
+
+        sineBuffers[0] = (int16_t*)sineBuffer;
+
+        for (uint32_t i = 1; i < NUMBER_OF_SINE_BUFFERS; i += 1) {
+            sineBuffers[i] = sineBuffers[i - 1] + MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER / NUMBER_OF_BYTES_IN_SAMPLE;
+        }
+
+    }
+
+    /* Set LED colour */
+
+    setLED(switchPosition);
+
+    /* Start the microphone samples */
+
+    AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
+
+    bool useDefaultSetting = (overrideOption == OVERRIDE_NONE || overrideOption == OVERRIDE_GAIN) && switchPosition == AM_SWITCH_DEFAULT;
+
+    bool useDefaultGainRange = overrideOption == OVERRIDE_NONE && switchPosition == AM_SWITCH_DEFAULT;
+
+    setupAndStartMicrophoneSamples(useDefaultSetting, useDefaultGainRange);
+
+    /* Enable the USB interface */
+
+    USBD_Init(&initstruct);
+
+    /* Initialise the real time clock and enter loop */
+
+    bool cancel = false;
+
+    uint32_t usbCounter = 0;
+
+    uint32_t switchChangeCounter = 0;
+
+    enterSerialBootloader = false;
+
+    microphoneHIDResponse = false;
+
+    AudioMoth_startRealTimeClock(USB_EM2_RTC_WAKEUP_INTERVAL);
+
+    while (cancel == false && enterSerialBootloader == false) { 
+
+        /* Check for switch change */
+
+        AM_switchPosition_t currentSwitchPosition = AudioMoth_getSwitchPosition();
+
+        /* Check for switch change to USB/OFF or configuration change requiring re-enumeration  and then exit the loop */
+
+        usbCounter = currentSwitchPosition == AM_SWITCH_USB || (microphoneConfigurationChanged && *enumerationRequired != ENUMERATE_NONE) ? usbCounter + 1 : 0;
+
+        if (usbCounter > USB_DELAY_COUNT) cancel = true;
+
+        /* Check for switch change between DEFAULT and CUSTOM */
+
+        switchChangeCounter = ((switchPosition == AM_SWITCH_DEFAULT && currentSwitchPosition == AM_SWITCH_CUSTOM) \
+                                || (switchPosition == AM_SWITCH_CUSTOM && currentSwitchPosition == AM_SWITCH_DEFAULT)) ? switchChangeCounter + 1 : 0;
+
+        if (switchChangeCounter > SWITCH_DEBOUNCE_COUNT) {
+
+            /* Update switch position */
+
+            switchPosition = currentSwitchPosition;
+
+            /* Restart the microphone samples */
+
+            restartMicrophoneSamples(switchPosition, DEFAULT_DELAY_INTERVAL);
+
+            /* Reset counter */
+
+            switchChangeCounter = 0;
+
+        }
+
+        /* Handle microphone change */
+
+        if (microphoneChanged) {
+
+            /* Restart the microphone samples */
+
+            restartMicrophoneSamples(switchPosition, MICROPHONE_CHANGE_INTERVAL);
+
+            /* Reset flag */
+
+            microphoneChanged = false;
+
+        }
+
+        /* Handle configuration change that does not require re-enumeration */
+
+        if (microphoneConfigurationChanged && *enumerationRequired == ENUMERATE_NONE) {
+
+            /* Restart the microphone samples */
+
+            restartMicrophoneSamples(switchPosition, DEFAULT_DELAY_INTERVAL);
+
+            /* Reset flag */
+
+            microphoneConfigurationChanged = false;
+
+        }
+
+        /* Handle persistent write */
+
+        if (writePersistentConfiguration) cancel = true;
+
+        /* Check and handle time overflow */
+
+        AudioMoth_checkAndHandleTimeOverflow();
+
+        /* Enter low power standby if USB is unplugged */
+
+        if (USBD_SafeToEnterEM2()) {
+            
+            /* Disable LED and microphone for deep sleep */
+
+            AudioMoth_disableMicrophone();
+
+            AudioMoth_setBothLED(false);
+
+            /* Enter deep sleep (EM2) */
+
+            AudioMoth_deepSleep();
+
+            /* Restart microphone samples */
+
+            bool useDefaultSetting = (overrideOption == OVERRIDE_NONE || overrideOption == OVERRIDE_GAIN) && switchPosition == AM_SWITCH_DEFAULT;
+
+            bool useDefaultGainRange = overrideOption == OVERRIDE_NONE && switchPosition == AM_SWITCH_DEFAULT;
+
+            setupAndStartMicrophoneSamples(useDefaultSetting, useDefaultGainRange);
+
+        }
+
+        /* Sleep until next interrupt */
+
+        AudioMoth_delay(MAIN_LOOP_WAIT_INTERVAL);
+
+    }
+
+    /* Disable the microphone */
+
+    AudioMoth_disableMicrophone();
+
+    /* Ensure last USB message has been sent */
+
+    if (enterSerialBootloader) AudioMoth_delay(DEFAULT_DELAY_INTERVAL);
+
+    /* Disconnect USB */
+
+    USBD_Disconnect();
+
+    /* Disable real time clock */
+
+    AudioMoth_stopRealTimeClock();
 
     /* Turn off LED */
 
     AudioMoth_setBothLED(false);
+
+    /* Enter bootloader */
+
+    if (enterSerialBootloader) {
+
+        /* Disable watch dog timer */
+
+        WDOG_Enable(false);
+
+        /* Pull bootloader pin high */
+
+        GPIO->ROUTE &= ~GPIO_ROUTE_SWCLKPEN;
+
+        GPIO_PinModeSet(gpioPortF, 0, gpioModePushPull, 1);
+
+        /* Jump to bootloader */
+
+        __asm (
+
+            /* Define the bootloader and vector table addresses */
+
+            ".equ BOOTLOADER_ADDRESS, 0x00000000\n\t"
+
+            ".equ SCB_VTOR, (0xE000E000 + 0x0D00 + 0x008)\n\t"
+
+            /* Load the bootloader address */
+
+            "ldr r0, =BOOTLOADER_ADDRESS\n\t"
+
+            /* Set the vector table */
+
+            "ldr r1, =SCB_VTOR\n\t"
+            "str r0, [r1]\n\t"
+
+            /* Set the stack pointer */
+
+            "ldr r1, [r0]\n\t"
+            "msr msp, r1\n\t"
+            "msr psp, r1\n\t"
+
+            /* Jump into the bootloader */
+
+            "ldr r1, [r0, #4]\n\t"
+            "mov pc, r1\n\t"
+
+        );
+
+    }
 
     /* Power down */
 
