@@ -109,8 +109,10 @@
 #define HID_RESTORE_MESSAGE                     0x04
 #define HID_READ_MESSAGE                        0x05
 #define HID_PERSIST_MESSAGE                     0x06
-#define HID_FIRMARE_MESSAGE                     0x07
+#define HID_FIRMWARE_MESSAGE                    0x07
 #define HID_BOOTLOADER_MESSAGE                  0x08
+#define HID_GET_MICROPHONE_MESSAGE              0x09
+#define HID_SET_MICROPHONE_MESSAGE              0x0A
 
 /* Serial number constants */
 
@@ -184,9 +186,11 @@ static configSettings_t defaultConfigSettings = {
 
 static uint32_t *enumerationRequired = (uint32_t*)AM_BACKUP_DOMAIN_START_ADDRESS;
 
+static uint32_t *ignoreExternalMicrophone = (uint32_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 4);
+
 static configSettings_t *configSettings = (configSettings_t*)&defaultConfigSettings; 
 
-static configSettings_t *backupConfigSettings = (configSettings_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 4);
+static configSettings_t *backupConfigSettings = (configSettings_t*)(AM_BACKUP_DOMAIN_START_ADDRESS + 8);
 
 /* Persistent configuration data structure */
 
@@ -244,6 +248,8 @@ static bool microphoneRestarting;
 
 static uint16_t microphoneAlternative;
 
+static AM_externalMicrophone_t externalMicrophone;
+
 static volatile bool microphoneChanged;
 
 static volatile bool microphoneHIDResponse;
@@ -282,15 +288,15 @@ static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUF
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 3, 1};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 3, 2};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
 
 /* Microphone USB HID buffers */
 
-SL_ALIGN(4) static uint8_t microphoneHIDReceiveBuffer[2 * MICROPHONE_HID_BUFFER_SIZE];
+static SL_ALIGN(4) uint8_t microphoneHIDReceiveBuffer[2 * MICROPHONE_HID_BUFFER_SIZE];
 
-SL_ALIGN(4) static uint8_t microphoneHIDTransmitBuffer[2 * MICROPHONE_HID_BUFFER_SIZE];
+static SL_ALIGN(4) uint8_t microphoneHIDTransmitBuffer[2 * MICROPHONE_HID_BUFFER_SIZE];
 
 /* Function prototypes */
 
@@ -469,9 +475,11 @@ static void setupAndStartMicrophoneSamples(bool useDefaultSetting, bool useDefau
 
     /* Enable the microphone and initialise direct memory access */
 
-    AM_gainRange_t gainRange = useDefaultGainRange ? AM_NORMAL_GAIN_RANGE : configSettings->enableLowGainRange ? AM_LOW_GAIN_RANGE : AM_NORMAL_GAIN_RANGE;
+    AudioMoth_ignoreExternalMicrophone(*ignoreExternalMicrophone);
 
-    bool externalMicrophone = AudioMoth_enableMicrophone(gainRange, configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
+    AM_gainRange_t gainRange = useDefaultGainRange ? AM_NORMAL_GAIN_RANGE : configSettings->enableLowGainRange ? AM_LOW_GAIN_RANGE : AM_NORMAL_GAIN_RANGE;
+    
+    externalMicrophone = AudioMoth_enableMicrophone(gainRange, configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
 
     AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, numberOfRawSamplesInDMATransfer);
 
@@ -481,7 +489,7 @@ static void setupAndStartMicrophoneSamples(bool useDefaultSetting, bool useDefau
 
     if (AudioMoth_hasInvertedOutput()) sampleMultiplier = -sampleMultiplier;
 
-    if (externalMicrophone) sampleMultiplier = -sampleMultiplier;
+    if (externalMicrophone == AM_EXTERNAL_PRESENT_AND_USED) sampleMultiplier = -sampleMultiplier;
 
     DigitalFilter_applyAdditionalGain(sampleMultiplier);
 
@@ -880,7 +888,7 @@ int dataReceivedMicrophoneHIDCallback(USB_Status_TypeDef status, uint32_t xferre
 
         overrideOption = OVERRIDE_NONE;
 
-    } else if (microphoneHIDReceiveBuffer[0] == HID_FIRMARE_MESSAGE) {
+    } else if (microphoneHIDReceiveBuffer[0] == HID_FIRMWARE_MESSAGE) {
 
         /* Confirm message received */
 
@@ -901,6 +909,46 @@ int dataReceivedMicrophoneHIDCallback(USB_Status_TypeDef status, uint32_t xferre
         /* Set flag */
 
         enterSerialBootloader = true;
+
+    } else if (microphoneHIDReceiveBuffer[0] == HID_GET_MICROPHONE_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Check for external microphone */
+
+        bool externalMicrophonePresent = AudioMoth_isExternalMicrophonePresent();
+
+        if (externalMicrophonePresent == false && externalMicrophone == AM_EXTERNAL_PRESENT_AND_IGNORED) {
+            
+            externalMicrophone = AM_EXTERNAL_NOT_PRESENT;
+
+        }
+        
+        if (externalMicrophonePresent == true && externalMicrophone == AM_EXTERNAL_NOT_PRESENT) {
+            
+            externalMicrophone = AM_EXTERNAL_PRESENT_AND_IGNORED;
+
+        }
+
+        /* Copy microphone state */
+
+        microphoneHIDTransmitBuffer[1] = externalMicrophone;
+
+    } else if (microphoneHIDReceiveBuffer[0] == HID_SET_MICROPHONE_MESSAGE) {
+
+        /* Confirm message received */
+
+        microphoneHIDTransmitBuffer[0] = microphoneHIDReceiveBuffer[0];
+
+        /* Set flag */
+
+        *ignoreExternalMicrophone = microphoneHIDReceiveBuffer[1];
+
+        if (*ignoreExternalMicrophone == true && externalMicrophone == AM_EXTERNAL_PRESENT_AND_USED) microphoneConfigurationChanged = true;
+
+        if (*ignoreExternalMicrophone == false && externalMicrophone == AM_EXTERNAL_PRESENT_AND_IGNORED) microphoneConfigurationChanged = true;
 
     }
 
@@ -1094,7 +1142,13 @@ int main(void) {
 
     /* Reset enumeration flag if this is an initial power up */
 
-    if (AudioMoth_isInitialPowerUp()) *enumerationRequired = ENUMERATE_NONE;
+    if (AudioMoth_isInitialPowerUp()) {
+        
+        *enumerationRequired = ENUMERATE_NONE;
+
+        *ignoreExternalMicrophone = false;
+
+    }
 
     /* Restore the backup or persistent configuration */
 
