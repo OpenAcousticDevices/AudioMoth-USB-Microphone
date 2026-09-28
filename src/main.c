@@ -13,6 +13,7 @@
 #include "em_gpio.h"
 #include "em_wdog.h"
 
+#include "usbmacros.h"
 #include "audiomoth.h"
 #include "microphone.h"
 #include "digitalfilter.h"
@@ -92,13 +93,7 @@
 
 /* USB descriptor constants */
 
-#define USB_PRODUCT_STRING_DESCRIPTOR_INDEX     2
-#define USB_SERIAL_STRING_DESCRIPTOR_INDEX      3
-
-#define USB_STRING_DESCRIPTOR_OFFSET            2
-#define USB_STRING_DESCRIPTOR_SIZE              128
-
-#define USB_SERIAL_NUMBER_LENGTH                4
+#define USB_DEVICE_REVISION_LENGTH              4
 #define BITS_PER_BCD_DIGIT                      4
 
 /* HID configuration constants */
@@ -208,12 +203,6 @@ typedef struct {
 
 static persistentConfigSettings_t persistentConfigSettings __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
 
-/* USB descriptors */
-
-static uint8_t productDescriptor[USB_STRING_DESCRIPTOR_SIZE] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
-
-static uint8_t serialDescriptor[USB_STRING_DESCRIPTOR_SIZE] __attribute__ ((aligned(UINT32_SIZE_IN_BYTES)));
-
 /* LED status */
 
 ledStatus_t redLED = LED_OFF;
@@ -288,7 +277,7 @@ static uint8_t sineBuffer[MAXIMUM_NUMBER_OF_BYTES_IN_BUFFER * NUMBER_OF_SINE_BUF
 
 /* Firmware version and description */
 
-static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 3, 2};
+static uint8_t firmwareVersion[AM_FIRMWARE_VERSION_LENGTH] = {1, 3, 3};
 
 static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-USB-Microphone";
 
@@ -380,7 +369,7 @@ static void setupAndStartMicrophoneSamples(bool useDefaultSetting, bool useDefau
 
     uint32_t sampleRate = effectiveSampleRate / HERTZ_IN_KILOHERTZ;
 
-    for (uint32_t i = 0; i < USB_SERIAL_NUMBER_LENGTH; i += 1) {
+    for (uint32_t i = 0; i < USB_DEVICE_REVISION_LENGTH; i += 1) {
 
         uint32_t digit = sampleRate % 10;
 
@@ -392,39 +381,27 @@ static void setupAndStartMicrophoneSamples(bool useDefaultSetting, bool useDefau
 
     /* Update USB serial number for sample rate and device unique ID */
 
-    for (uint32_t i = 0; i < USB_STRING_DESCRIPTOR_SIZE; i += 1) serialDescriptor[i] = 0;
+    char *serialNumber = (char*)&iSerialNumber.name;
 
-    uint32_t length = sprintf((char*)serialDescriptor + USB_STRING_DESCRIPTOR_OFFSET, "%04lu_" SERIAL_NUMBER, effectiveSampleRate / HERTZ_IN_KILOHERTZ, FORMAT_SERIAL_NUMBER(AM_UNIQUE_ID_START_ADDRESS));
+    uint32_t length = sprintf(serialNumber, "%04lu_" AM_SERIAL_NUMBER, effectiveSampleRate / HERTZ_IN_KILOHERTZ, AM_FORMAT_SERIAL_NUMBER(AM_UNIQUE_ID_START_ADDRESS));
 
-    serialDescriptor[0] = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
+    char16_t *dstSerialNumber = (char16_t*)serialNumber;
 
-    serialDescriptor[1] = USB_STRING_DESCRIPTOR;
+    for (uint32_t i = 0; i < length; i += 1) dstSerialNumber[length - 1 - i] = serialNumber[length - 1 - i];
 
-    char *src = (char*)serialDescriptor + USB_STRING_DESCRIPTOR_OFFSET;
-
-    char16_t *dst = (char16_t*)src;
-
-    for (uint32_t i = 0; i < length; i += 1) dst[length - 1 - i] = src[length - 1 - i];
-
-    strings[USB_SERIAL_STRING_DESCRIPTOR_INDEX] = serialDescriptor;
+    iSerialNumber.len = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
 
     /* Update USB string descriptor for sample rate */
 
-    for (uint32_t i = 0; i < USB_STRING_DESCRIPTOR_SIZE; i += 1) productDescriptor[i] = 0;
+    char *product = (char*)&iProduct.name;
 
-    length = sprintf((char*)productDescriptor + USB_STRING_DESCRIPTOR_OFFSET, "%lukHz AudioMoth USB Microphone", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
+    length = sprintf(product, "%lukHz AudioMoth USB Microphone", effectiveSampleRate / HERTZ_IN_KILOHERTZ);
 
-    productDescriptor[0] = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
+    char16_t *dstProduct = (char16_t*)product;
 
-    productDescriptor[1] = USB_STRING_DESCRIPTOR;
+    for (uint32_t i = 0; i < length; i += 1) dstProduct[length - 1 - i] = product[length - 1 - i];
 
-    src = (char*)productDescriptor + USB_STRING_DESCRIPTOR_OFFSET;
-
-    dst = (char16_t*)src;
-
-    for (uint32_t i = 0; i < length; i += 1) dst[length - 1 - i] = src[length - 1 - i];
-
-    strings[USB_PRODUCT_STRING_DESCRIPTOR_INDEX] = productDescriptor;
+    iProduct.len = CHAR16_SIZE_IN_BYTES * length + CHAR16_SIZE_IN_BYTES;
 
     /* Update USB configuration sample rate and buffer size */
 
@@ -1268,7 +1245,7 @@ int main(void) {
 
         AM_switchPosition_t currentSwitchPosition = AudioMoth_getSwitchPosition();
 
-        /* Check for switch change to USB/OFF or configuration change requiring re-enumeration  and then exit the loop */
+        /* Check for switch change to USB/OFF or configuration change requiring re-enumeration and then exit the loop */
 
         usbCounter = currentSwitchPosition == AM_SWITCH_USB || (microphoneConfigurationChanged && *enumerationRequired != ENUMERATE_NONE) ? usbCounter + 1 : 0;
 

@@ -287,9 +287,9 @@ STATIC_CONST_STRING_DESC_LANGID(langID, 0x04, 0x09);
 
 STATIC_CONST_STRING_DESC(iManufacturer, 'o', 'p', 'e', 'n', 'a', 'c', 'o', 'u', 's', 't', 'i', 'c', 'd', 'e', 'v', 'i', 'c', 'e', 's', '.', 'i', 'n', 'f', 'o');
 
-STATIC_CONST_STRING_DESC(iProduct, 'A', 'u', 'd', 'i', 'o', 'M', 'o', 't', 'h', ' ', 'U', 'S', 'B', ' ', 'M', 'i', 'c', 'r', 'o', 'p', 'h', 'o', 'n', 'e');
+STATIC_MUTABLE_STRING_DESC(iProduct, '3', '8', '4', 'k', 'H', 'z', ' ', 'A', 'u', 'd', 'i', 'o', 'M', 'o', 't', 'h', ' ', 'U', 'S', 'B', ' ', 'M', 'i', 'c', 'r', 'o', 'p', 'h', 'o', 'n', 'e');
 
-STATIC_CONST_STRING_DESC(iSerialNumber, '0', '0', '0', '0', '_', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0');
+STATIC_MUTABLE_STRING_DESC(iSerialNumber, '0', '0', '0', '0', '_', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0');
 
 /* End-point buffer sizes */
 
@@ -303,7 +303,7 @@ static const uint8_t bufferingMultiplier[NUM_EP_USED + 1] = {
 
 /* String array */
 
-static const void* strings[] = {
+static const void* const strings[] = {
     &langID,
     &iManufacturer,
     &iProduct,
